@@ -1,0 +1,207 @@
+#include <M5Stack.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// --- Configuración WiFi ---
+const char* ssid     = "DIGIFIBRA-P9zt";
+const char* password = "4t5Z7y3YutEC";
+
+// --- Configuración MQTT ---
+const char* mqtt_server = "192.168.1.158";
+const int   mqtt_port   = 1883;
+
+// Topics
+const char* MQTT_TOPIC_ESTADO      = "qubi/buzon/BX001/estado";      // JAR -> M5 (estado real, retained)
+const char* MQTT_TOPIC_ESTADO_SET  = "qubi/buzon/BX001/estado/set";  // M5 -> JAR (solo para cerrar)
+const char* MQTT_TOPIC_ALERTA      = "qubi/buzon/BX001/alerta";      // M5 -> JAR (alertas)
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Pines
+#define SW420_PIN 36
+#define LED_PIN   26
+
+// --- Altavoz (alerta) ---
+#define ALERT_FREQ 2000
+const unsigned long ledDuration = 300; // ms
+
+// Estado (lo manda el JAR por MQTT_TOPIC_ESTADO)
+bool puertaCerrada = true;   // true=cerrada, false=abierta
+bool sensorActivo  = true;   // solo activo con puerta cerrada
+
+// Temporizadores
+unsigned long lastLedTime   = 0;
+bool ledState = false;
+
+unsigned long lastDebounce  = 0;
+const unsigned long debounceDelay = 200; // ms
+
+void mostrarEstadoSensor() {
+  M5.Lcd.fillScreen(BLACK);
+
+  M5.Lcd.setCursor(10, 40);
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.println("SIMULACION DE");
+  M5.Lcd.setCursor(10, 90);
+  M5.Lcd.println("CERRADURA");
+
+  M5.Lcd.setCursor(10, 150);
+  M5.Lcd.setTextSize(2);
+
+  if (puertaCerrada) {
+    M5.Lcd.setTextColor(GREEN);
+    M5.Lcd.println("Puerta CERRADA");
+    M5.Lcd.setCursor(10, 190);
+    M5.Lcd.println("(sensor activado)");
+  } else {
+    M5.Lcd.setTextColor(RED);
+    M5.Lcd.println("Puerta ABIERTA");
+    M5.Lcd.setCursor(10, 190);
+    M5.Lcd.println("(sensor desactivado)");
+  }
+}
+
+void aplicarEstadoDesdeMQTT(const String& estado) {
+  String e = estado;
+  e.trim();
+  e.toUpperCase();
+
+  bool nuevoCerrado = puertaCerrada;
+
+  if (e == "CERRADO") nuevoCerrado = true;
+  else if (e == "ABIERTO") nuevoCerrado = false;
+  else return; // payload desconocido
+
+  if (nuevoCerrado != puertaCerrada) {
+    puertaCerrada = nuevoCerrado;
+    sensorActivo  = puertaCerrada;
+
+    Serial.print("Estado actualizado desde MQTT: ");
+    Serial.println(puertaCerrada ? "CERRADO" : "ABIERTO");
+
+    mostrarEstadoSensor();
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+  String t = String(topic);
+  Serial.print("MQTT <- [");
+  Serial.print(t);
+  Serial.print("] ");
+  Serial.println(msg);
+
+  if (t == MQTT_TOPIC_ESTADO) {
+    aplicarEstadoDesdeMQTT(msg);
+  }
+}
+
+void setup_wifi() {
+  Serial.println("Conectando WiFi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.println("Intentando conectar MQTT...");
+    String clientId = "M5Stack_" + String(random(0xffff), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("Conectado a Mosquitto!");
+
+      // Suscribirse al estado real (retained) para recibirlo al instante
+      client.subscribe(MQTT_TOPIC_ESTADO, 1);
+      Serial.print("Suscrito a: ");
+      Serial.println(MQTT_TOPIC_ESTADO);
+
+    } else {
+      Serial.print("Fallo MQTT rc=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+}
+
+// Solo se usa para mandar "CERRADO" cuando el botón simula cerrar
+void publicarCerrado() {
+  client.publish(MQTT_TOPIC_ESTADO_SET, "CERRADO", true); // ✅ retained
+  Serial.println("Publicado cierre -> CERRADO (estado/set, retained)");
+}
+
+void setup() {
+  M5.begin();
+  Serial.begin(115200);
+
+  M5.Speaker.begin();
+
+  pinMode(SW420_PIN, INPUT_PULLDOWN);
+  pinMode(LED_PIN, OUTPUT);
+
+  setup_wifi();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  // Estado inicial (se corregirá cuando llegue el retained del JAR)
+  puertaCerrada = true;
+  sensorActivo  = true;
+  mostrarEstadoSensor();
+}
+
+void loop() {
+  M5.update();
+
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  // Botón B: SOLO CIERRA (si está abierta)
+  if (M5.BtnB.wasPressed()) {
+    unsigned long now = millis();
+    if (now - lastDebounce > debounceDelay) {
+
+      if (!puertaCerrada) {
+        // Cerrar localmente y avisar al JAR
+        puertaCerrada = true;
+        sensorActivo  = true;
+        mostrarEstadoSensor();
+        publicarCerrado();
+      } else {
+        Serial.println("Ya esta CERRADO -> no hago nada");
+      }
+
+      lastDebounce = now;
+    }
+  }
+
+  // Vibración solo si está cerrado (sensor activo)
+  if (sensorActivo) {
+    int lectura = digitalRead(SW420_PIN);
+    if (lectura == HIGH && !ledState) {
+      Serial.println("Movimiento detectado con puerta cerrada -> posible robo!");
+      client.publish(MQTT_TOPIC_ALERTA, "INTENTO_ROBO");
+
+      digitalWrite(LED_PIN, HIGH);
+      M5.Speaker.tone(ALERT_FREQ, ledDuration);
+
+      ledState = true;
+      lastLedTime = millis();
+    }
+  }
+
+  if (ledState && millis() - lastLedTime >= ledDuration) {
+    digitalWrite(LED_PIN, LOW);
+    ledState = false;
+  }
+}
