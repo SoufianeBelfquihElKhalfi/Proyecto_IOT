@@ -1,0 +1,228 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <M5Stack.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// -------------------------
+// WIFI
+// -------------------------
+const char* ssid = "TP-LINK_6CAE";
+const char* password = "41422915";
+
+// -------------------------
+// ESP32-CAM UDP
+// -------------------------
+const char* esp32cam_ip = "192.168.0.103";  // IP de la cam
+const int udpPort = 4210;
+WiFiUDP Udp;
+
+// -------------------------
+// FIRESTORE REST
+// -------------------------
+String apiKey    = "AIzaSyBHTeOdFk1BlxFirAU1eFHjonV7YjrlpO4";
+String projectID = "qubi-d3588";
+
+// Config notificación
+String buzonNumeroIdentificador = "BX001";
+String usuarioId = "M5StackCam";
+
+// Debounce
+bool botonPresionado = false;
+unsigned long ultimoTiempoBoton = 0;
+const unsigned long debounceTime = 250;
+
+// -------------------------
+// TIME (NTP)
+// -------------------------
+void syncTime() {
+  configTime(3600, 0, "pool.ntp.org", "time.nist.gov"); // UTC+1 fijo
+  time_t now = 0;
+  int retries = 0;
+  while (now < 1700000000 && retries < 30) {
+    delay(250);
+    time(&now);
+    retries++;
+  }
+}
+
+String isoTimestampUTC() {
+  time_t now;
+  time(&now);
+  struct tm tmUtc;
+  gmtime_r(&now, &tmUtc);
+
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+  return String(buf);
+}
+
+// -------------------------
+// RANDOM NAME
+// -------------------------
+String generarNombreImagen() {
+  uint32_t r = (uint32_t)esp_random();
+  time_t now;
+  time(&now);
+
+  char hexbuf[9];
+  snprintf(hexbuf, sizeof(hexbuf), "%08X", (unsigned)r);
+
+  return buzonNumeroIdentificador + "_" + String((unsigned long)now) + "_" + String(hexbuf) + ".jpg";
+}
+
+// -------------------------
+// UDP SEND
+// -------------------------
+void enviarUDP(const String& mensaje) {
+  Udp.beginPacket(esp32cam_ip, udpPort);
+  Udp.print(mensaje);
+  Udp.endPacket();
+
+  Serial.print("UDP Enviado: ");
+  Serial.println(mensaje);
+}
+
+// -------------------------
+// FIRESTORE: crear notificación
+// -------------------------
+bool crearNotificacionSolicitud(const String& nombreImagen) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + projectID +
+               "/databases/(default)/documents/notificaciones?key=" + apiKey;
+
+  if (!http.begin(client, url)) {
+    Serial.println("❌ http.begin() falló");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  String titulo  = "🔔 Solicitud de Apertura en " + buzonNumeroIdentificador;
+  String mensaje = "Se ha solicitado una apertura en tu buzón " + buzonNumeroIdentificador;
+
+  JsonDocument doc;
+  JsonObject fields = doc["fields"].to<JsonObject>();
+
+  fields["buzonNumeroIdentificador"]["stringValue"] = buzonNumeroIdentificador;
+  fields["fecha"]["timestampValue"] = isoTimestampUTC();
+  fields["leido"]["booleanValue"] = false;
+  fields["mensaje"]["stringValue"] = mensaje;
+  fields["tipo"]["stringValue"] = "solicitud";
+  fields["titulo"]["stringValue"] = titulo;
+  fields["usuarioId"]["stringValue"] = usuarioId;
+
+  // Guardas solo el nombre (la cam lo sube a notificaciones/<nombre>)
+  fields["imagen"]["stringValue"] = nombreImagen;
+
+  String json;
+  serializeJson(doc, json);
+
+  int code = http.POST(json);
+  Serial.printf("Firestore HTTP code: %d\n", code);
+
+  if (code > 0) Serial.println(http.getString());
+  http.end();
+
+  return (code == 200 || code == 201);
+}
+
+// -------------------------
+// UI
+// -------------------------
+void mostrarPantallaInicio() {
+  M5.Lcd.clear();
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setTextColor(WHITE, BLACK);
+  M5.Lcd.setCursor(20, 100);
+  M5.Lcd.println("PULSE EL BOTON B");
+}
+
+void mostrarPantallaHaciendoFoto() {
+  M5.Lcd.clear();
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setTextColor(GREEN, BLACK);
+
+  M5.Lcd.setCursor(10, 40);  M5.Lcd.println("LE VAMOS A");
+  M5.Lcd.setCursor(10, 80);  M5.Lcd.println("TOMAR UNA");
+  M5.Lcd.setCursor(10, 120); M5.Lcd.println("FOTO");
+  M5.Lcd.setCursor(10, 170); M5.Lcd.println("ESPERE UN");
+  M5.Lcd.setCursor(10, 210); M5.Lcd.println("POCO...");
+}
+
+// -------------------------
+// SETUP
+// -------------------------
+void setup() {
+  M5.begin();
+  Serial.begin(115200);
+
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.print("Conectando WiFi...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    M5.Lcd.print(".");
+  }
+
+  M5.Lcd.println("\nWiFi conectado!");
+  M5.Lcd.print("IP: ");
+  M5.Lcd.println(WiFi.localIP());
+
+  // ✅ Importante: iniciar UDP (aunque solo envíes)
+  Udp.begin(udpPort);
+
+  syncTime();
+
+  delay(1200);
+  mostrarPantallaInicio();
+}
+
+// -------------------------
+// LOOP
+// -------------------------
+void loop() {
+  M5.update();
+
+  bool estadoActual = M5.BtnB.isPressed();
+  unsigned long ahora = millis();
+
+  if (estadoActual && !botonPresionado && (ahora - ultimoTiempoBoton > debounceTime)) {
+    botonPresionado = true;
+    ultimoTiempoBoton = ahora;
+
+    mostrarPantallaHaciendoFoto();
+
+    // 1) Generar nombre de imagen
+    String nombreImagen = generarNombreImagen();
+ delay(2000);
+    // 2) Enviar a la cámara el nombre (para que suba a Storage con ese nombre)
+    enviarUDP("CAPTURE:" + nombreImagen);
+
+    // 3) Crear notificación tipo "solicitud" con campo "imagen"
+    bool okNoti = crearNotificacionSolicitud(nombreImagen);
+
+    // 4) Mostrar resultado
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.setTextColor(WHITE, BLACK);
+    M5.Lcd.printf("Noti: %s", okNoti ? "OK" : "FALLO");
+    M5.Lcd.setCursor(10, 30);
+    M5.Lcd.printf("Img: %s", nombreImagen.c_str());
+
+    delay(1800);
+    mostrarPantallaInicio();
+  }
+
+  if (!estadoActual && botonPresionado && (ahora - ultimoTiempoBoton > debounceTime)) {
+    botonPresionado = false;
+    ultimoTiempoBoton = ahora;
+  }
+}
