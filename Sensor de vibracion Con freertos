@@ -1,0 +1,344 @@
+
+Sensor de vibracion Con freertos
+
+// Vibración hecho en freertos
+
+#include <M5Stack.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ===================== WIFI =====================
+const char* ssid     = "DIGIFIBRA-P9zt";
+const char* password = "4t5Z7y3YutEC";
+
+// ===================== MQTT =====================
+const char* mqtt_server = "192.168.1.158";
+const int   mqtt_port   = 1883;
+
+const char* MQTT_TOPIC_ESTADO      = "qubi/buzon/BX001/estado";      // JAR -> M5 (estado real, retained)
+const char* MQTT_TOPIC_ESTADO_SET  = "qubi/buzon/BX001/estado/set";  // M5 -> JAR (solo para cerrar/abrir si quieres)
+const char* MQTT_TOPIC_ALERTA      = "qubi/buzon/BX001/alerta";      // M5 -> JAR (alertas)
+
+// ===================== HW =====================
+#define SW420_PIN 35
+#define LED_PIN   26
+
+#define ALERT_FREQ 2000
+const unsigned long ledDuration = 300; // ms
+
+// ===================== LÓGICA (NO CAMBIAR FUNCIONAMIENTO) =====================
+// Estado recibido del JAR por MQTT_TOPIC_ESTADO
+static volatile bool puertaCerrada = true;   // true=cerrada, false=abierta
+static volatile bool sensorActivo  = true;   // activo solo con puerta cerrada
+
+// Debounce botones
+static const unsigned long debounceDelay = 200; // ms
+static unsigned long lastDebounce = 0;
+
+// Anti-spam vibración (recomendado)
+static const unsigned long alertaCooldownMs = 10000; // 10s
+static unsigned long lastAlertaSent = 0;
+
+// LED/Buzzer temporización
+static volatile bool ledState = false;
+static unsigned long lastLedTime = 0;
+
+// ===================== MQTT CLIENT =====================
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ===================== FREERTOS IPC =====================
+enum CmdType : uint8_t { CMD_PUB_ALERTA, CMD_PUB_ESTADO_SET };
+
+typedef struct {
+  CmdType type;
+  char payload[32];
+} MqttCmd;
+
+static QueueHandle_t mqttQueue = nullptr;
+static SemaphoreHandle_t stateMutex = nullptr;
+
+// ===================== UI =====================
+void mostrarEstadoSensor() {
+  M5.Lcd.fillScreen(BLACK);
+
+  M5.Lcd.setCursor(10, 40);
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setTextColor(WHITE);
+  M5.Lcd.println("SIMULACION DE");
+  M5.Lcd.setCursor(10, 90);
+  M5.Lcd.println("CERRADURA");
+
+  M5.Lcd.setCursor(10, 150);
+  M5.Lcd.setTextSize(2);
+
+  bool cerrado;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  cerrado = puertaCerrada;
+  xSemaphoreGive(stateMutex);
+
+  if (cerrado) {
+    M5.Lcd.setTextColor(GREEN);
+    M5.Lcd.println("Puerta CERRADA");
+    M5.Lcd.setCursor(10, 190);
+    M5.Lcd.println("(sensor activado)");
+  } else {
+    M5.Lcd.setTextColor(RED);
+    M5.Lcd.println("Puerta ABIERTA");
+    M5.Lcd.setCursor(10, 190);
+    M5.Lcd.println("(sensor desactivado)");
+  }
+}
+
+void aplicarEstadoDesdeMQTT(const String& estado) {
+  String e = estado;
+  e.trim();
+  e.toUpperCase();
+
+  bool nuevoCerrado;
+  bool aplicar = false;
+
+  if (e == "CERRADO") {
+    nuevoCerrado = true;
+    aplicar = true;
+  } else if (e == "ABIERTO") {
+    nuevoCerrado = false;
+    aplicar = true;
+  }
+
+  if (!aplicar) return;
+
+  bool cambio = false;
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (nuevoCerrado != puertaCerrada) {
+    puertaCerrada = nuevoCerrado;
+    sensorActivo  = puertaCerrada;
+    cambio = true;
+  }
+  xSemaphoreGive(stateMutex);
+
+  if (cambio) {
+    Serial.print("Estado actualizado desde MQTT: ");
+    Serial.println(nuevoCerrado ? "CERRADO" : "ABIERTO");
+    mostrarEstadoSensor();
+  }
+}
+
+// ===================== MQTT CALLBACK (se ejecuta dentro de client.loop()) =====================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  msg.reserve(length);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+  String t = String(topic);
+  Serial.print("MQTT <- [");
+  Serial.print(t);
+  Serial.print("] ");
+  Serial.println(msg);
+
+  if (t == MQTT_TOPIC_ESTADO) {
+    aplicarEstadoDesdeMQTT(msg);
+  }
+}
+
+// ===================== WIFI/MQTT HELPERS =====================
+void setup_wifi_blocking() {
+  Serial.println("Conectando WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi conectado!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void mqttReconnect_blocking() {
+  while (!client.connected()) {
+    Serial.println("Intentando conectar MQTT...");
+    String clientId = "M5Stack_" + String((uint32_t)esp_random(), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("Conectado a Mosquitto!");
+
+      // Suscribirse al estado real (retained)
+      client.subscribe(MQTT_TOPIC_ESTADO, 1);
+      Serial.print("Suscrito a: ");
+      Serial.println(MQTT_TOPIC_ESTADO);
+    } else {
+      Serial.print("Fallo MQTT rc=");
+      Serial.println(client.state());
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+  }
+}
+
+void enqueueMqttCmd(CmdType type, const char* payload) {
+  if (!mqttQueue) return;
+  MqttCmd cmd;
+  cmd.type = type;
+  memset(cmd.payload, 0, sizeof(cmd.payload));
+  strncpy(cmd.payload, payload, sizeof(cmd.payload) - 1);
+  xQueueSend(mqttQueue, &cmd, 0);
+}
+
+// ===================== TASKS =====================
+
+// 1) Task MQTT: única encargada de client.loop() y publish (evita problemas de thread-safety)
+void TaskMQTT(void* pv) {
+  setup_wifi_blocking();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      // Reintento WiFi
+      Serial.println("WiFi desconectado. Reintentando...");
+      setup_wifi_blocking();
+    }
+
+    if (!client.connected()) {
+      mqttReconnect_blocking();
+    }
+
+    // Procesar entradas MQTT (callback se ejecuta aquí)
+    client.loop();
+
+    // Procesar comandos pendientes (publish) desde otras tareas
+    MqttCmd cmd;
+    while (xQueueReceive(mqttQueue, &cmd, 0) == pdTRUE) {
+      if (cmd.type == CMD_PUB_ALERTA) {
+        client.publish(MQTT_TOPIC_ALERTA, cmd.payload);
+        Serial.print("Publicado alerta -> ");
+        Serial.println(cmd.payload);
+      } else if (cmd.type == CMD_PUB_ESTADO_SET) {
+        // retained para que el JAR lo reciba incluso si reconecta
+        client.publish(MQTT_TOPIC_ESTADO_SET, cmd.payload, true);
+        Serial.print("Publicado estado/set (retained) -> ");
+        Serial.println(cmd.payload);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// 2) Task UI/Botones: mantiene M5.update() y gestiona botón de cerrar (como tu código)
+void TaskUI(void* pv) {
+  // Estado inicial
+  mostrarEstadoSensor();
+
+  for (;;) {
+    M5.update();
+
+    // Botón B: SOLO CIERRA (si está abierta)
+    if (M5.BtnB.wasPressed()) {
+      unsigned long now = millis();
+      if (now - lastDebounce > debounceDelay) {
+
+        bool cerrado;
+        xSemaphoreTake(stateMutex, portMAX_DELAY);
+        cerrado = puertaCerrada;
+        xSemaphoreGive(stateMutex);
+
+        if (!cerrado) {
+          // Cerrar localmente + avisar al JAR
+          xSemaphoreTake(stateMutex, portMAX_DELAY);
+          puertaCerrada = true;
+          sensorActivo  = true;
+          xSemaphoreGive(stateMutex);
+
+          mostrarEstadoSensor();
+          enqueueMqttCmd(CMD_PUB_ESTADO_SET, "CERRADO");
+        } else {
+          Serial.println("Ya esta CERRADO -> no hago nada");
+        }
+
+        lastDebounce = now;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// 3) Task Vibración: solo publica INTENTO_ROBO si sensorActivo y cooldown OK
+void TaskVibracion(void* pv) {
+  for (;;) {
+    bool activo;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    activo = sensorActivo;
+    xSemaphoreGive(stateMutex);
+
+    if (activo) {
+      int lectura = digitalRead(SW420_PIN);
+      if (lectura == HIGH) {
+        unsigned long now = millis();
+        if (now - lastAlertaSent >= alertaCooldownMs) {
+          Serial.println("Movimiento detectado con puerta cerrada -> posible robo!");
+          enqueueMqttCmd(CMD_PUB_ALERTA, "INTENTO_ROBO");
+
+          digitalWrite(LED_PIN, HIGH);
+          M5.Speaker.tone(ALERT_FREQ, ledDuration);
+
+          ledState = true;
+          lastLedTime = now;
+          lastAlertaSent = now;
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// 4) Task LED: apaga el LED cuando pase ledDuration
+void TaskLed(void* pv) {
+  for (;;) {
+    if (ledState) {
+      unsigned long now = millis();
+      if (now - lastLedTime >= ledDuration) {
+        digitalWrite(LED_PIN, LOW);
+        ledState = false;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ===================== SETUP/LOOP =====================
+void setup() {
+  M5.begin();
+  Serial.begin(115200);
+  M5.Speaker.begin();
+
+  pinMode(SW420_PIN, INPUT_PULLDOWN);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // IPC
+  mqttQueue = xQueueCreate(10, sizeof(MqttCmd));
+  stateMutex = xSemaphoreCreateMutex();
+
+  // Estado inicial (se corregirá al recibir retained del JAR)
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  puertaCerrada = true;
+  sensorActivo  = true;
+  xSemaphoreGive(stateMutex);
+
+  // Tareas
+  xTaskCreatePinnedToCore(TaskMQTT,     "TaskMQTT",     8192, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(TaskUI,       "TaskUI",       6144, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskVibracion,"TaskVibracion",4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskLed,      "TaskLed",      2048, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  // No usar loop: todo va por tareas FreeRTOS
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
